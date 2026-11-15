@@ -32,10 +32,28 @@ services:
       imap:
         condition: service_healthy
 
-  # 演示控制：对样例邮箱执行重投/重建/修复等操作
+  # 演示控制：对样例邮箱执行投递/重投/重建/修复等操作
   mailctl:
+    build: .
     image: imap-csv-collector:latest
     entrypoint: ["python", "-m", "imap_server.cli", "--root", "/srv/mail"]
+    environment:
+      MAIL_ROOT: /srv/mail
+    volumes:
+      - mail_data:/srv/mail
+    depends_on:
+      imap:
+        condition: service_healthy
+    profiles: ["tools"]
+
+  # 并发投递场景：默认并发写入 12 封不同 Message-ID 的仪器 CSV。
+  # 可执行 `docker compose run --rm deliver --count 30` 调整数量；
+  # 同时启动多个该容器（见 scripts/demo.sh 第 5 步）可验证跨进程独立 UID。
+  deliver:
+    build: .
+    image: imap-csv-collector:latest
+    entrypoint: ["python", "-m", "imap_server.cli", "--root", "/srv/mail", "deliver-csv"]
+    command: ["--count", "12"]
     environment:
       MAIL_ROOT: /srv/mail
     volumes:

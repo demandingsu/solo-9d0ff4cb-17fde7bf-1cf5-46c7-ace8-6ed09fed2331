@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import email
+import email.utils
 import hashlib
 import imaplib
 import re
@@ -140,9 +141,20 @@ def _fetch_message(client: imaplib.IMAP4, uid: int) -> bytes:
         raise IngestError(f"UID {uid} FETCH 失败", uid=uid)
     if not data:
         raise IngestError(f"UID {uid} FETCH 未返回内容", uid=uid)
-    # data 形如 [(b'1 (UID 3 RFC822 {123}', bytes), b')']
+    # data 形如 [(b'1 (UID 3 BODY[] {123}', bytes), b')']
     for item in data:
         if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], bytes):
+            header = item[0] if isinstance(item[0], bytes) else b""
+            match = re.search(rb"\{(\d+)\}", header)
+            if match is not None:
+                expected = int(match.group(1))
+                # 连接被中途掐断时 imaplib 可能返回短字面量：绝不入库半封邮件
+                if len(item[1]) != expected:
+                    raise IngestError(
+                        f"UID {uid} 邮件内容不完整（声明 {expected} 字节，"
+                        f"实际 {len(item[1])} 字节），停止采集",
+                        uid=uid,
+                    )
             return item[1]
     raise IngestError(f"UID {uid} FETCH 响应结构无法识别", uid=uid)
 
@@ -167,6 +179,30 @@ def _extract_subject(msg: Message) -> str | None:
         return "".join(parts)
     except (LookupError, UnicodeDecodeError):
         return str(subject)
+
+
+def _header_text(msg: Message, name: str) -> str | None:
+    value = msg.get(name)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _extract_addresses(msg: Message, name: str) -> str | None:
+    value = msg.get(name)
+    if value is None:
+        return None
+    try:
+        addresses = email.utils.getaddresses([str(value)])
+        rendered = ", ".join(
+            f"{addr}" if not real else f"{real} <{addr}>"
+            for real, addr in addresses
+            if addr
+        )
+        return rendered or str(value).strip() or None
+    except Exception:
+        return str(value).strip() or None
 
 
 def _csv_attachments(msg: Message) -> list[tuple[str, bytes]]:
@@ -300,6 +336,9 @@ def _collect_locked(
                 msg = email.message_from_bytes(raw_message)
                 message_id = _extract_message_id(msg)
                 subject = _extract_subject(msg)
+                sender = _extract_addresses(msg, "From")
+                recipient = _extract_addresses(msg, "To")
+                message_date = _header_text(msg, "Date")
                 attachments = _csv_attachments(msg)
                 if not attachments:
                     raise IngestError(
@@ -361,6 +400,11 @@ def _collect_locked(
                     db.insert_delivery(
                         conn, mailbox_key, message_id, digest,
                         uid, remote_validity,
+                        subject=subject,
+                        sender=sender,
+                        recipient=recipient,
+                        attachment_names=[name for name, _ in attachments],
+                        message_date=message_date,
                     )
                     db.upsert_state(conn, mailbox_key, remote_validity, uid)
 
@@ -369,6 +413,9 @@ def _collect_locked(
                         "uid": uid,
                         "message_id": message_id,
                         "subject": subject,
+                        "sender": sender,
+                        "recipient": recipient,
+                        "message_date": message_date,
                         "attachments": [name for name, _ in attachments],
                         "record_count": len(all_records),
                         "attachment_digest": digest,

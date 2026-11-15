@@ -4,9 +4,10 @@
   serve                 启动 IMAP 服务
   seed-if-empty         邮箱为空时写入演示种子邮件
   list                  查看文件夹 UID 与 Message-ID
-  replace-uid           用修复后的 CSV 重写指定 UID 的邮件
+  replace-uid           用修复后的 CSV 重写指定 UID 的邮件（原子替换）
   redeliver             以新 UID 重投指定邮件（附件原样）
   redeliver-modified    以新 UID 重投同 Message-ID 但替换附件内容的邮件
+  deliver-csv           并发投递多封仪器 CSV（每封独立 Message-ID/UID）
   rebuild               模拟邮箱重建：更换 UIDVALIDITY 并把 UID 从 1 重排
 """
 from __future__ import annotations
@@ -15,6 +16,7 @@ import argparse
 import email
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from . import mailbox, seed as seed_mod
 from .server import serve
@@ -69,9 +71,7 @@ def cmd_replace_uid(args: argparse.Namespace) -> None:
         raise SystemExit(f"UID {args.uid} 不存在")
     payload = _load_attachment_bytes(args.csv_path)
     new_raw = _replace_attachment(raw, args.attachment, payload)
-    path = f"{mailbox.folder_dir(args.root, args.folder)}/{args.uid}.eml"
-    with open(path, "wb") as fh:
-        fh.write(new_raw)
+    mailbox.replace_message(args.root, args.folder, args.uid, new_raw)
     print(f"已重写 UID={args.uid} 的附件 {args.attachment}")
 
 
@@ -92,6 +92,60 @@ def cmd_redeliver_modified(args: argparse.Namespace) -> None:
     new_uid = mailbox.append_message(args.root, args.folder, new_raw)
     print(
         f"已重投（附件被修改）Message-ID={_message_id(raw)}，新 UID={new_uid}"
+    )
+
+
+def cmd_deliver_csv(args: argparse.Namespace) -> None:
+    """并发投递 N 封内容各不相同的仪器 CSV 邮件。
+
+    每封使用独立 Message-ID 与独立 CSV 行，模拟多个资料员同时上传：
+    并发追加必须各自拿到不同 UID，否则邮件会互相覆盖。
+    """
+    count = args.count
+    if count < 1:
+        raise SystemExit("--count 必须为正整数")
+
+    batch = args.batch or f"CONC-{int(time.time())}"
+    specs = []
+    for index in range(1, count + 1):
+        sample_no = f"S-{args.sample_base + index - 1}"
+        payload = seed_mod.csv_text(
+            [
+                (
+                    sample_no,
+                    args.item,
+                    f"{index / 1000:.3f}",
+                    args.unit,
+                )
+            ]
+        )
+        message_id = f"{batch}-{index:03d}@lab-instrument"
+        specs.append((index, sample_no, message_id, payload))
+
+    def _deliver(spec):
+        index, sample_no, message_id, payload = spec
+        raw = mailbox.build_message(
+            message_id=message_id,
+            subject=f"仪器结果 并发批次 {batch} #{index:02d}",
+            sender=args.sender,
+            recipient=args.recipient,
+            attachments=[(f"{batch.lower()}_{index:02d}.csv", payload)],
+        )
+        uid = mailbox.append_message(args.root, args.folder, raw)
+        return index, sample_no, message_id, uid
+
+    with ThreadPoolExecutor(max_workers=count) as pool:
+        outcomes = list(pool.map(_deliver, specs))
+
+    uids = [uid for _, _, _, uid in outcomes]
+    if len(set(uids)) != len(uids):
+        raise SystemExit(f"投递失败：出现重复 UID {sorted(uids)}")
+
+    for index, sample_no, message_id, uid in sorted(outcomes):
+        print(f"UID={uid} sample={sample_no} Message-ID={message_id}")
+    print(
+        f"并发投递完成：{count} 封各自独立 UID，"
+        f"folder={args.folder} batch={batch}"
     )
 
 
@@ -147,6 +201,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_rebuild = sub.add_parser("rebuild", help="模拟邮箱重建（换 UIDVALIDITY）")
     p_rebuild.add_argument("--uidvalidity", type=int, default=0)
     p_rebuild.set_defaults(func=cmd_rebuild)
+
+    p_deliver = sub.add_parser(
+        "deliver-csv", help="并发投递多封仪器 CSV 邮件（每封独立 Message-ID/UID）"
+    )
+    p_deliver.add_argument(
+        "--count", type=int, default=8, help="并发投递的邮件数量"
+    )
+    p_deliver.add_argument("--batch", default="", help="批次名，用于 Message-ID")
+    p_deliver.add_argument(
+        "--sample-base", type=int, default=2001, help="首个样品编号后缀"
+    )
+    p_deliver.add_argument("--item", default="铅Pb", help="检测项目")
+    p_deliver.add_argument("--unit", default="mg/kg", help="单位")
+    p_deliver.add_argument(
+        "--sender", default="instrument-a@lab.local", help="发件人"
+    )
+    p_deliver.add_argument("--recipient", default="lab@lab.local", help="收件人")
+    p_deliver.set_defaults(func=cmd_deliver_csv)
     return parser
 
 

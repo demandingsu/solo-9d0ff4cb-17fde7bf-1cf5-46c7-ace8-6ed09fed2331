@@ -38,6 +38,28 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
     return conn
 
 
+# mail_delivery 的“邮件来源”元数据列。旧库通过 ALTER TABLE 补齐，
+# 不影响已经入库的投递与结果。
+_DELIVERY_SOURCE_COLUMNS = {
+    "subject": "TEXT",
+    "sender": "TEXT",
+    "recipient": "TEXT",
+    "attachment_names": "TEXT",  # JSON 数组字符串
+    "message_date": "TEXT",
+}
+
+
+def _ensure_columns(
+    conn: sqlite3.Connection, table: str, columns: dict[str, str]
+) -> None:
+    existing = {
+        row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    for name, decl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -56,6 +78,11 @@ def init_db(conn: sqlite3.Connection) -> None:
             first_uid         INTEGER NOT NULL,
             uidvalidity       INTEGER NOT NULL,
             ingested_at       TEXT NOT NULL,
+            subject           TEXT,
+            sender            TEXT,
+            recipient         TEXT,
+            attachment_names  TEXT,
+            message_date      TEXT,
             UNIQUE (mailbox_key, message_id)
         );
 
@@ -77,6 +104,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             ON mail_delivery (mailbox_key);
         """
     )
+    # 兼容升级前的数据库文件：补齐邮件来源列
+    _ensure_columns(conn, "mail_delivery", _DELIVERY_SOURCE_COLUMNS)
     conn.commit()
 
 
@@ -131,13 +160,20 @@ def insert_delivery(
     attachment_digest: str,
     uid: int,
     uidvalidity: int,
+    *,
+    subject: str | None = None,
+    sender: str | None = None,
+    recipient: str | None = None,
+    attachment_names: list[str] | None = None,
+    message_date: str | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO mail_delivery
             (mailbox_key, message_id, attachment_digest, first_uid,
-             uidvalidity, ingested_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+             uidvalidity, ingested_at, subject, sender, recipient,
+             attachment_names, message_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             mailbox_key,
@@ -146,6 +182,11 @@ def insert_delivery(
             uid,
             uidvalidity,
             _utcnow(),
+            subject,
+            sender,
+            recipient,
+            json.dumps(attachment_names or [], ensure_ascii=False),
+            message_date,
         ),
     )
 
@@ -205,10 +246,44 @@ def list_deliveries(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         """
         SELECT mailbox_key, message_id, attachment_digest, first_uid,
-               uidvalidity, ingested_at
+               uidvalidity, ingested_at, subject, sender, recipient,
+               attachment_names, message_date
         FROM mail_delivery
         ORDER BY id
         """,
+    ).fetchall()
+
+
+def find_delivery_detail(
+    conn: sqlite3.Connection, message_id: str, mailbox_key: str | None = None
+) -> sqlite3.Row | None:
+    """按 Message-ID 查询投递来源（可限定邮箱）。"""
+    if mailbox_key is None:
+        return conn.execute(
+            "SELECT * FROM mail_delivery WHERE message_id = ? ORDER BY id LIMIT 1",
+            (message_id,),
+        ).fetchone()
+    return conn.execute(
+        """
+        SELECT * FROM mail_delivery
+        WHERE mailbox_key = ? AND message_id = ?
+        """,
+        (mailbox_key, message_id),
+    ).fetchone()
+
+
+def query_results_by_message(
+    conn: sqlite3.Connection, message_id: str
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT id, sample_no, test_item, result, unit, message_id, uid,
+               mailbox_key, ingested_at
+        FROM test_result
+        WHERE message_id = ?
+        ORDER BY id
+        """,
+        (message_id,),
     ).fetchall()
 
 
